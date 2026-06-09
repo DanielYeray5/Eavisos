@@ -1,20 +1,24 @@
-# Usar una imagen base de Node.js
+# Imagen base Node.js LTS
 FROM node:18-alpine
 
-# Establecer el directorio de trabajo en el contenedor
+# Instalar dependencias del sistema para grpc (compilación nativa)
+RUN apk add --no-cache python3 make g++
+
+# Directorio de trabajo
 WORKDIR /usr/src/app
 
-# Copiar los archivos de definición de paquetes
+# Copiar archivos de dependencias
 COPY package*.json ./
 
-# Instalar las dependencias del proyecto
-# En un entorno de producción, se usaría 'npm ci' para instalaciones más rápidas y fiables
+# Instalar dependencias
 RUN npm install
 
-# Copiar el resto de los archivos de la aplicación
+# Copiar el resto de los archivos
 COPY . .
 
-# El puerto se expondrá en el docker-compose.yml
+# Exponer puertos HTTP y gRPC
+EXPOSE 3005
+EXPOSE 50051
 
-# Comando para iniciar la aplicación
-CMD [ "node", "index.js" ]
+# Comando de inicio
+CMD ["node", "index.js"]
