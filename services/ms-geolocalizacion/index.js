@@ -1,77 +1,84 @@
+// index.js - ms-geolocalizacion
+// Punto de entrada del Microservicio de Geolocalización
+// Sistema C5 - Alerta Ciudadana
+//
+// Responsabilidad: Consumir alertas de Redis, enriquecer con datos geográficos
+//                  y reencolarlas para el siguiente microservicio.
+
+'use strict';
+
 const express = require('express');
 const redis = require('redis');
-const NodeGeocoder = require('node-geocoder');
+const geoRoutes = require('./routes/geoRoutes');
+const { enriquecerConGeo } = require('./models/geoModel');
 
+// --- Configuración ---
 const app = express();
-const port = process.env.APP_PORT || 3002;
-
-// --- Configuración de Conexiones ---
-const redisHost = process.env.REDIS_HOST || 'localhost';
-const redisPort = process.env.REDIS_PORT || 6379;
-
-// --- Clientes ---
-const redisClient = redis.createClient({
-    url: `redis://${redisHost}:${redisPort}`
-});
-
-const geocoder = NodeGeocoder({ provider: 'openstreetmap' });
-
-// --- Constantes ---
+const PORT = process.env.APP_PORT || 3002;
+const REDIS_HOST = process.env.REDIS_HOST || 'localhost';
+const REDIS_PORT = process.env.REDIS_PORT || 6379;
 const IN_QUEUE = 'alertas_queue';
 const OUT_QUEUE = 'geolocalizadas_queue';
 
-// --- Lógica del Microservicio ---
-async function procesarAlertas() {
-    await redisClient.connect();
-    console.log(`Conectado a Redis en ${redisHost}:${redisPort}`);
-    
-    while (true) {
-        try {
-            console.log('Esperando alertas en la cola...');
-            const item = await redisClient.blPop(IN_QUEUE, 0);
-            
-            if (item) {
-                const alerta = JSON.parse(item.element);
-                console.log('Alerta recibida para geolocalización:', alerta.ID_dispositivo);
+// --- Clientes ---
+const redisClient = redis.createClient({ url: `redis://${REDIS_HOST}:${REDIS_PORT}` });
 
-                const { lat, lon } = alerta.coordenadas;
+redisClient.on('error', (err) => console.error('[Redis] Error:', err));
+app.locals.redisClient = redisClient;
 
-                // Obtener información geográfica
-                const res = await geocoder.reverse({ lat, lon });
-                
-                if (res && res.length > 0) {
-                    alerta.geolocalizacion = {
-                        direccion: res[0].formattedAddress,
-                        pais: res[0].country,
-                        ciudad: res[0].city,
-                        codigoPostal: res[0].zipcode,
-                    };
-                    console.log(`Geolocalización exitosa para la alerta ${alerta.ID_dispositivo}`);
-                } else {
-                    console.warn(`No se pudo geolocalizar la alerta ${alerta.ID_dispositivo}`);
-                    alerta.geolocalizacion = null;
-                }
+// --- Middleware ---
+app.use(express.json());
 
-                // Encolar la alerta procesada
-                await redisClient.rPush(OUT_QUEUE, JSON.stringify(alerta));
-                console.log(`Alerta geolocalizada encolada.`);
-            }
-        } catch (error) {
-            console.error('Error al procesar la alerta:', error);
-            // Esperar un poco antes de reintentar para no sobrecargar en caso de error persistente
-            await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-    }
-}
+// --- Rutas ---
+app.use('/api', geoRoutes);
 
 app.get('/', (req, res) => {
-    res.send('Microservicio de Geolocalización');
+  res.json({ servicio: 'ms-geolocalizacion', version: '2.0.0', estado: 'activo' });
 });
 
-app.listen(port, () => {
-    console.log(`Microservicio de Geolocalización escuchando en http://localhost:${port}`);
-    procesarAlertas().catch(err => {
-        console.error("Fallo el procesamiento de alertas:", err);
-        process.exit(1);
-    });
+// --- Worker: procesamiento continuo de alertas ---
+async function procesarAlertas() {
+  console.log(`[Worker] Escuchando en cola '${IN_QUEUE}'...`);
+
+  while (true) {
+    try {
+      // blPop bloquea hasta recibir un elemento (timeout 0 = indefinido)
+      const item = await redisClient.blPop(IN_QUEUE, 0);
+      if (!item) continue;
+
+      const alerta = JSON.parse(item.element);
+      console.log(`[Worker] Alerta recibida: ${alerta.ID_dispositivo}`);
+
+      // Enriquecer con geolocalización (modelo)
+      const alertaEnriquecida = await enriquecerConGeo(alerta);
+
+      // Encolar para el siguiente microservicio
+      await redisClient.rPush(OUT_QUEUE, JSON.stringify(alertaEnriquecida));
+      console.log(`[Worker] Alerta ${alerta.ID_dispositivo} encolada en '${OUT_QUEUE}'.`);
+
+    } catch (err) {
+      console.error('[Worker] Error al procesar alerta:', err.message);
+      await new Promise((res) => setTimeout(res, 1000));
+    }
+  }
+}
+
+// --- Arranque ---
+async function main() {
+  await redisClient.connect();
+  console.log(`[Redis] Conectado a ${REDIS_HOST}:${REDIS_PORT}`);
+
+  app.listen(PORT, () => {
+    console.log(`[HTTP] ms-geolocalizacion escuchando en http://localhost:${PORT}`);
+  });
+
+  procesarAlertas().catch((err) => {
+    console.error('[ERROR FATAL] Fallo en el worker de geolocalización:', err);
+    process.exit(1);
+  });
+}
+
+main().catch((err) => {
+  console.error('[ERROR FATAL] No se pudo iniciar el microservicio:', err);
+  process.exit(1);
 });

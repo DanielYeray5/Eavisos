@@ -1,149 +1,92 @@
+// index.js - ms-historial
+// Punto de entrada del Microservicio de Historial de Incidentes
+// Sistema C5 - Alerta Ciudadana
+//
+// Responsabilidad: Persistencia de alertas vía Redis (backup) y gRPC (principal).
+//                  Servidor gRPC para recibir alertas desde ms-notificaciones.
+//                  API REST para consultas con filtros desde la réplica.
+
+'use strict';
+
 const express = require('express');
-const { Pool } = require('pg');
 const redis = require('redis');
+const historialRoutes = require('./routes/historialRoutes');
+const { initDb, insertarAlerta } = require('./models/alertaDbModel');
+const { startGrpcServer } = require('./grpc/server');
 
+// --- Configuración ---
 const app = express();
-app.use(express.json());
-const port = process.env.APP_PORT || 3005;
+const PORT = process.env.APP_PORT || 3005;
+const GRPC_PORT = process.env.GRPC_PORT || 50051;
+const REDIS_HOST = process.env.REDIS_HOST || 'localhost';
+const REDIS_PORT = process.env.REDIS_PORT || 6379;
 
-// --- Configuración de Conexiones ---
-const redisHost = process.env.REDIS_HOST || 'localhost';
-const redisPort = process.env.REDIS_PORT || 6379;
-
-const dbConfigMaster = {
-    user: process.env.DB_USER,
-    host: process.env.DB_HOST_MASTER,
-    database: process.env.DB_NAME,
-    password: process.env.DB_PASSWORD,
-    port: process.env.DB_PORT_MASTER,
-};
-
-const dbConfigReplica = {
-    user: process.env.DB_USER,
-    host: process.env.DB_HOST_REPLICA,
-    database: process.env.DB_NAME,
-    password: process.env.DB_PASSWORD,
-    port: process.env.DB_PORT_REPLICA,
-};
-
-// --- Clientes ---
-const redisClient = redis.createClient({ url: `redis://${redisHost}:${redisPort}` });
-const masterPool = new Pool(dbConfigMaster);
-const replicaPool = new Pool(dbConfigReplica);
-
-// --- Constantes ---
+// La cola de Redis actúa como respaldo/fallback al gRPC
 const IN_QUEUE = 'historial_queue';
 
-// --- Lógica del Microservicio ---
+// --- Clientes Redis ---
+const redisClient = redis.createClient({ url: `redis://${REDIS_HOST}:${REDIS_PORT}` });
+redisClient.on('error', (err) => console.error('[Redis] Error:', err));
 
-async function initDb() {
-    try {
-        await masterPool.query(`
-            CREATE TABLE IF NOT EXISTS alertas (
-                id SERIAL PRIMARY KEY,
-                id_dispositivo VARCHAR(255) NOT NULL,
-                lat DOUBLE PRECISION NOT NULL,
-                lon DOUBLE PRECISION NOT NULL,
-                timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
-                tipo_emergencia VARCHAR(100),
-                direccion TEXT,
-                pais VARCHAR(100),
-                ciudad VARCHAR(100),
-                prioridad VARCHAR(50),
-                fecha_creacion TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-            );
-        `);
-        console.log("Tabla 'alertas' verificada/creada correctamente.");
-    } catch (error) {
-        console.error("Error al inicializar la base de datos:", error);
-        process.exit(1);
-    }
-}
+// --- Middleware ---
+app.use(express.json());
 
-async function procesarAlertas() {
-    await redisClient.connect();
-    console.log(`Conectado a Redis en ${redisHost}:${redisPort}`);
-
-    while (true) {
-        try {
-            const item = await redisClient.blPop(IN_QUEUE, 0);
-            if (!item) continue;
-
-            const alerta = JSON.parse(item.element);
-            console.log('Alerta recibida para guardar en historial:', alerta.ID_dispositivo);
-
-            const {
-                ID_dispositivo, coordenadas, timestamp, tipo_emergencia,
-                geolocalizacion, prioridad
-            } = alerta;
-
-            const query = `
-                INSERT INTO alertas (id_dispositivo, lat, lon, timestamp, tipo_emergencia, direccion, pais, ciudad, prioridad)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-            `;
-            const values = [
-                ID_dispositivo, coordenadas.lat, coordenadas.lon, timestamp,
-                tipo_emergencia, geolocalizacion?.direccion, geolocalizacion?.pais,
-                geolocalizacion?.ciudad, prioridad
-            ];
-
-            await masterPool.query(query, values);
-            console.log(`Alerta ${alerta.ID_dispositivo} guardada en la base de datos.`);
-
-        } catch (error) {
-            console.error('Error al procesar o guardar la alerta:', error);
-            await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-    }
-}
-
-// --- API para Consultas ---
-app.get('/historial', async (req, res) => {
-    try {
-        const { fecha_inicio, fecha_fin, zona, prioridad } = req.query;
-        
-        let query = 'SELECT * FROM alertas';
-        const conditions = [];
-        const values = [];
-        let valueIndex = 1;
-
-        if (fecha_inicio) {
-            conditions.push(`timestamp >= $${valueIndex++}`);
-            values.push(fecha_inicio);
-        }
-        if (fecha_fin) {
-            conditions.push(`timestamp <= $${valueIndex++}`);
-            values.push(fecha_fin);
-        }
-        if (prioridad) {
-            conditions.push(`prioridad = $${valueIndex++}`);
-            values.push(prioridad);
-        }
-        if (zona) {
-            conditions.push(`ciudad ILIKE $${valueIndex++}`);
-            values.push(`%${zona}%`);
-        }
-
-        if (conditions.length > 0) {
-            query += ' WHERE ' + conditions.join(' AND ');
-        }
-        query += ' ORDER BY timestamp DESC';
-
-        const { rows } = await replicaPool.query(query, values);
-        res.json(rows);
-
-    } catch (error) {
-        console.error('Error al consultar el historial:', error);
-        res.status(500).send('Error interno del servidor');
-    }
-});
+// --- Rutas ---
+app.use('/api', historialRoutes);
 
 app.get('/', (req, res) => {
-    res.send('Microservicio de Historial');
+  res.json({ servicio: 'ms-historial', version: '2.0.0', estado: 'activo' });
 });
 
-app.listen(port, async () => {
-    console.log(`Microservicio de Historial escuchando en http://localhost:${port}`);
-    await initDb();
-    procesarAlertas().catch(err => console.error("Fallo el procesamiento de alertas:", err));
+// --- Worker Redis: canal de respaldo al gRPC ---
+// Consume la cola 'historial_queue' para garantizar que ninguna alerta
+// se pierda si el cliente gRPC falla (tolerancia a fallos).
+async function procesarAlertasRedis() {
+  console.log(`[Redis Worker] Escuchando cola de respaldo '${IN_QUEUE}'...`);
+
+  while (true) {
+    try {
+      const item = await redisClient.blPop(IN_QUEUE, 0);
+      if (!item) continue;
+
+      const alerta = JSON.parse(item.element);
+      console.log(`[Redis Worker] Alerta recibida desde cola: ${alerta.ID_dispositivo}`);
+      await insertarAlerta(alerta);
+      console.log(`[Redis Worker] Alerta ${alerta.ID_dispositivo} guardada vía Redis (fallback).`);
+
+    } catch (err) {
+      console.error('[Redis Worker] Error al procesar alerta:', err.message);
+      await new Promise((res) => setTimeout(res, 1000));
+    }
+  }
+}
+
+// --- Arranque ---
+async function main() {
+  // 1. Inicializar base de datos (crear tabla si no existe)
+  await initDb();
+
+  // 2. Conectar Redis
+  await redisClient.connect();
+  console.log(`[Redis] Conectado a ${REDIS_HOST}:${REDIS_PORT}`);
+
+  // 3. Iniciar servidor gRPC (canal principal de recepción)
+  startGrpcServer(GRPC_PORT);
+
+  // 4. Iniciar servidor HTTP
+  app.listen(PORT, () => {
+    console.log(`[HTTP] ms-historial escuchando en http://localhost:${PORT}`);
+    console.log(`[HTTP] Rutas: GET /api/historial, GET /api/historial/:id, GET /api/health`);
+  });
+
+  // 5. Iniciar worker Redis (canal de respaldo)
+  procesarAlertasRedis().catch((err) => {
+    console.error('[ERROR FATAL] Fallo en worker Redis:', err);
+    process.exit(1);
+  });
+}
+
+main().catch((err) => {
+  console.error('[ERROR FATAL] No se pudo iniciar el microservicio:', err);
+  process.exit(1);
 });
