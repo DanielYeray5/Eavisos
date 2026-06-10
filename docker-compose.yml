@@ -92,6 +92,7 @@ services:
 
   ms-recepcion-alertas-1: &ms-recepcion-alertas-base
     build: ./services/ms-recepcionAlertas
+    container_name: ms-recepcion-alertas-1
     environment:
       MQTT_URL: mqtt://mqtt-broker:${MQTT_PORT:-1883}
       REDIS_HOST: redis
@@ -105,12 +106,15 @@ services:
 
   ms-recepcion-alertas-2:
     <<: *ms-recepcion-alertas-base
+    container_name: ms-recepcion-alertas-2
 
   ms-recepcion-alertas-3:
     <<: *ms-recepcion-alertas-base
+    container_name: ms-recepcion-alertas-3
 
   ms-geolocalizacion:
     build: ./services/ms-geolocalizacion
+    container_name: ms-geolocalizacion
     environment:
       REDIS_HOST: redis
       REDIS_PORT: ${REDIS_PORT:-6379}
@@ -121,6 +125,7 @@ services:
 
   ms-prioridad:
     build: ./services/ms-prioridad
+    container_name: ms-prioridad
     environment:
       REDIS_HOST: redis
       REDIS_PORT: ${REDIS_PORT:-6379}
@@ -131,8 +136,9 @@ services:
 
   ms-notificaciones:
     build: ./services/ms-notificaciones
+    container_name: ms-notificaciones
     ports:
-      - "${MS_NOTIFICACIONES_PORT:-3004}:3004"
+      - "${MS_NOTIFICACIONES_PORT:-3004}:${MS_NOTIFICACIONES_PORT:-3004}"
     environment:
       REDIS_HOST: redis
       REDIS_PORT: ${REDIS_PORT:-6379}
@@ -145,8 +151,9 @@ services:
 
   ms-historial:
     build: ./services/ms-historial
+    container_name: ms-historial
     ports:
-      - "${MS_HISTORIAL_PORT:-3005}:3005"
+      - "${MS_HISTORIAL_PORT:-3005}:${MS_HISTORIAL_PORT:-3005}"
       - "${GRPC_PORT:-50051}:50051"
     environment:
       DB_HOST_MASTER: postgres-master
